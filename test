@@ -1,0 +1,264 @@
+# Student Event Sync Batch — Functional Design
+
+
+## 1. Overview
+
+A scheduled batch job reads new rows from `student_event`, fetches the matching `student` record, and processes it in strict order. It resumes safely after any failure or crash without re-reading records already done.
+
+**Scope**
+
+- Runs on a scheduler (for example every 12 hours); only one instance runs at a time.
+- Reads events in batches of up to 500 (configurable) and loops until no events remain.
+- Tracks every run and every batch iteration for reporting and troubleshooting.
+
+**Key design principles**
+
+1. **Order by time.** `event_id` is a UUID and cannot be sorted, so events are ordered by `event_last_modified_ts`, with `event_id` as the tie-breaker.
+2. **Checkpoint per iteration.** Each iteration saves its checkpoint only after its work is committed. A crash loses at most one in-flight batch.
+3. **Resume from the last successful iteration.** Failed or crashed iterations are ignored when finding the resume point.
+4. **Status is the lock.** A new run starts only if the latest run is `SUCCESS` or `FAILED` (or a stuck run is stale).
+5. **Reprocessing is acceptable, skipping is not.** Redoing one batch is safe; missing an event or breaking order is not.
+
+## 2. Tables
+
+Four tables: two existing source tables and two new tracking tables. The resume point is read from `batch_iteration` only.
+
+### 2.1 student\_event (existing, source)
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| event\_id | UUID | Unique, not sortable; used only as tie-breaker |
+| student\_id | VARCHAR / BIGINT | Student that changed |
+| event\_last\_modified\_ts | TIMESTAMP | Ordering column; should be DB-generated |
+
+Recommended index: `(event_last_modified_ts, event_id)`.
+
+### 2.2 student (existing, target)
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| student\_id | PK | Looked up per event |
+| ...student fields... |  | Fetched and processed |
+| active | BOOLEAN | Set to `false` when the student is not found |
+
+Only this batch writes to `student`.
+
+### 2.3 batch\_scheduler (new, one row per run)
+
+| Column | Type | Notes | Example |
+| --- | --- | --- | --- |
+| run\_id | BIGINT, PK, auto-increment | Latest run = `MAX(run_id)` | 1024 |
+| status | VARCHAR | `INITIATED`, `PROCESSING`, `SUCCESS`, `FAILED` | SUCCESS |
+| run\_start\_ts | TIMESTAMP | When the scheduler fired | 2026-10-01 08:00:00 |
+| run\_end\_ts | TIMESTAMP | When the run finished (null while running or after a hard crash) | 2026-10-01 08:04:12 |
+| total\_processed | INT | Records processed in this run | 1500 |
+| event\_from\_last\_modified\_ts | TIMESTAMP | Earliest event last-modified time this run started from | 2026-09-30 14:22:10 |
+| event\_to\_last\_modified\_ts | TIMESTAMP | Latest event last-modified time this run reached | 2026-10-01 07:59:58 |
+| failed\_ts | TIMESTAMP | Set when status = `FAILED` | null (set only on failure) |
+| failed\_reason | VARCHAR | Error message or code | null |
+
+### 2.4 batch\_iteration (new, one row per batch of up to 500)
+
+| Column | Type | Notes | Example |
+| --- | --- | --- | --- |
+| iteration\_id | BIGINT, PK, auto-increment |  | 50213 |
+| run\_id | FK to batch\_scheduler | Groups iterations by run | 1024 |
+| iteration\_no | INT | 1, 2, 3 ... within the run | 2 |
+| status | VARCHAR | `PROCESSING`, `SUCCESS`, `FAILED` | SUCCESS |
+| iteration\_start\_ts / iteration\_end\_ts | TIMESTAMP | Whole iteration (fetch + process) | 2026-10-01 08:01:30 / 2026-10-01 08:02:45 |
+| fetched\_count | INT | Rows fetched (max 500) | 500 |
+| processed\_count | INT | Distinct students processed after dedup | 462 (38 duplicate student\_ids collapsed) |
+| event\_from\_last\_modified\_ts / event\_from\_id | TIMESTAMP / UUID | Checkpoint this iteration started from | 2026-09-30 18:40:05 / 7c9e6679-7425-40de-944b-e07fc1f90ae7 |
+| event\_to\_last\_modified\_ts / event\_to\_id | TIMESTAMP / UUID | Last event processed = new checkpoint | 2026-10-01 03:12:47 / 3f2504e0-4f89-11d3-9a0c-0305e82c3301 |
+| failed\_reason | VARCHAR | Set when status = `FAILED` | null (e.g. "SQLException: connection reset" when FAILED) |
+
+The `from_*` and `to_*` columns give the event last-modified time range each iteration covered. The `to_*` of the latest `SUCCESS` iteration is the resume point, and rolls up to the run's `from_event_last_modified_ts` / `to_event_last_modified_ts` so you can see the full window a whole run covered.
+
+## 3. End-to-end flow
+
+&#91;embedded content: batch run flow · init, iteration loop, success and fail exits\]
+
+A run loops over iterations until a fetch returns fewer than 500 events; any error ends the run as `FAILED`, and the next run resumes from the last saved checkpoint.
+
+## 4. Use case 1 — Init (scheduler starts)
+
+The scheduler fires and decides whether a new run may start.
+
+**Steps**
+
+1. Read the latest row: `SELECT * FROM batch_scheduler ORDER BY run_id DESC LIMIT 1`.
+2. Apply the start rule:
+
+| Latest run status | Action |
+| --- | --- |
+| No row (first ever run) | Start; checkpoint = beginning (or a configured start time) |
+| `SUCCESS` | Start a new run |
+| `FAILED` | Start a new run (resumes from last successful iteration) |
+| `INITIATED` / `PROCESSING`, not stale | Exit; another run is active |
+| `INITIATED` / `PROCESSING`, older than stale timeout | Mark it `FAILED`, reason `STALE_RUN_TIMEOUT`, then start |
+
+3. Insert a new `batch_scheduler` row: status `INITIATED`, `run_start_ts = now`.
+4. Read the resume checkpoint from the latest `SUCCESS` iteration (section 8, query B).
+5. Count pending events after the checkpoint.
+6. If the count is 0: set status `SUCCESS`, `run_end_ts = now`, `total_processed = 0`, and exit.
+7. Otherwise set status `PROCESSING` and start the iteration loop (use case 2).
+
+**What the statuses tell you when stuck**
+
+- Stuck on `INITIATED`: died before any batch started (for example DB connection failed).
+- Stuck on `PROCESSING`: died in the middle of a batch.
+
+## 5. Use case 2 — Success (iteration loop)
+
+Each iteration processes up to 500 events and saves its checkpoint before the next one starts.
+
+**Steps per iteration**
+
+1. Insert a `batch_iteration` row: status `PROCESSING`, `iteration_start_ts`, `from_*` = current checkpoint.
+2. Count pending events after the checkpoint → `total_pending`.
+3. Record `fetch_start_ts`, fetch up to 500 events ordered by `event_last_modified_ts, event_id` (section 8, query C), record `fetch_end_ts`.
+4. If 0 rows fetched: delete or close this iteration row and end the loop (go to step 9).
+5. Dedup by `student_id`, keeping the latest event per student.
+6. For each student, in order of `event_last_modified_ts`:
+   - Found → fetch the record and process / print it.
+   - Not found → set `active = false` and log it.
+7. Commit the student changes.
+8. In ONE transaction, update the iteration row: status `SUCCESS`, `iteration_end_ts`, counts, `remaining`, `to_*` = last event fetched. Then update `batch_scheduler.total_iterations` and `total_processed`.
+9. If fewer than 500 rows were fetched, the backlog is drained: set run status `SUCCESS`, `run_end_ts = now`, exit. Otherwise loop to step 1.
+
+**Example: 1,000 pending, batch size 500**
+
+| Iteration | total\_pending | fetched | cumulative\_processed | remaining | status |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1,000 | 500 | 500 | 500 | SUCCESS |
+| 2 | 500 | 500 | 1,000 | 0 | SUCCESS |
+| 3 | 0 | 0 | 1,000 | 0 | loop ends |
+
+Events that arrive during the run are picked up naturally because `total_pending` is recounted each iteration.
+
+## 6. Use case 3 — Fail
+
+A failure costs at most the one in-flight batch; completed iterations keep their checkpoints.
+
+### 6.1 Handled failure (error is caught)
+
+Examples: network error after JDBC retries are exhausted, SQL error, bad data.
+
+1. Catch the error and stop processing the batch.
+2. Roll back uncommitted student changes for this batch.
+3. Update the iteration row: status `FAILED`, `iteration_end_ts`, `failed_reason`. Do NOT write `to_*`.
+4. Update the run row: status `FAILED`, `failed_ts`, `failed_reason`, `run_end_ts`.
+5. Exit. No immediate retry; the next scheduled run resumes.
+
+### 6.2 Hard crash (no chance to update)
+
+Examples: out of memory, process killed, server restart.
+
+- Nothing is written. The iteration row stays `PROCESSING`; the run row stays `PROCESSING` with no `run_end_ts`.
+- The next scheduler sees a stuck run. Once it is older than the stale timeout, it marks the run `FAILED` (`STALE_RUN_TIMEOUT`) and starts a new run.
+
+### 6.3 How the next run resumes
+
+The resume point is the `to_*` checkpoint of the latest `SUCCESS` iteration across all runs. `FAILED` and stuck `PROCESSING` iterations are ignored.
+
+**Example: 900k pending, crash after 500k**
+
+- Iterations 1–1,000 succeeded; each saved its checkpoint. Iteration 1,001 crashed.
+- Next run reads the checkpoint of iteration 1,000 (the 500,000th event).
+- Query C returns only events after that point, so the next run processes the remaining 400k. The 500k done are never read again.
+- The 500 events of iteration 1,001 are redone, which is acceptable.
+
+### 6.4 Failure cases covered
+
+| When it fails | Result | Next run |
+| --- | --- | --- |
+| Before any fetch (startup, DB down) | Run stuck in `INITIATED` or marked `FAILED` | Starts from last checkpoint |
+| During event fetch | Iteration `FAILED`, nothing processed | Redoes the same batch |
+| During processing (event 300 of 500) | Partial batch rolled back | Redoes the full batch |
+| During the success write | Transaction rolls back; iteration not `SUCCESS` | Redoes the batch |
+| Hard crash anywhere | Rows left `PROCESSING` | After stale timeout, resumes from last `SUCCESS` iteration |
+
+## 7. Business rules and edge cases
+
+| # | Case | Rule |
+| --- | --- | --- |
+| 1 | No events pending | Run ends `SUCCESS` with 0 processed |
+| 2 | Fewer than 500 events | Process what is there; batch size is a ceiling |
+| 3 | Large backlog (e.g. 100k) | Loop batch after batch in the same run until drained |
+| 4 | Same student twice in a batch | Dedup; process the latest event only |
+| 5 | Student not found | Set `active = false`, log, continue |
+| 6 | Same event\_`last_modified_ts` on many events | Tie-break on `event_id`; checkpoint stores both |
+| 7 | Events arrive during a run | Picked up in later iterations via recount |
+| 8 | Overlapping scheduler trigger | Blocked by status check on latest run |
+| 9 | Network blip | JDBC retry layer handles it; if exhausted → handled failure |
+| 10 | Reprocessing a batch | Allowed; processing must be idempotent |
+| 11 | Order of updates | Always ascending event\_`last_modified_ts, event_id`; never skip ahead |
+
+**Configuration**
+
+- `batch.size` = 500
+- `stale.timeout` = e.g. 60 minutes (must exceed the longest normal run)
+- `scheduler.cron` = e.g. every 12 hours
+
+## 8. Key SQL queries
+
+**A. Latest run (start check)**
+
+```sql
+SELECT run_id, status, run_start_ts
+FROM batch_scheduler
+ORDER BY run_id DESC
+LIMIT 1;
+```
+
+**B. Resume checkpoint (latest successful iteration)**
+
+```sql
+SELECT to_event_last_modified_ts, to_event_id
+FROM batch_iteration
+WHERE status = 'SUCCESS'
+ORDER BY iteration_id DESC
+LIMIT 1;
+```
+
+**C. Fetch next batch**
+
+```sql
+SELECT event_id, student_id, event_last_modified_ts
+FROM student_event
+WHERE event_last_modified_ts > :lastTs
+   OR (event_last_modified_ts = :lastTs AND event_id > :lastEventId)
+ORDER BY event_last_modified_ts, event_id
+LIMIT 500;
+```
+
+**D. Pending count**
+
+```sql
+SELECT COUNT(*)
+FROM student_event
+WHERE event_last_modified_ts > :lastTs
+   OR (event_last_modified_ts = :lastTs AND event_id > :lastEventId);
+```
+
+**E. Mark iteration success (same transaction)**
+
+```sql
+UPDATE batch_iteration
+SET status = 'SUCCESS', iteration_end_ts = CURRENT_TIMESTAMP,
+    fetched_count = :fetched, processed_count = :processed,
+    cumulative_processed = :cumulative, remaining = :remaining,
+    to_event_last_modified_ts = :toTs, to_event_id = :toEventId
+WHERE iteration_id = :iterationId;
+```
+
+## 9. Open items
+
+- [ ] Confirm `event_last_modified_ts` is stored as UTC and that the JDBC driver and Java code read/bind it as `Instant`/`Timestamp` without converting through local time or a formatted string (avoids clock-skew and time-zone bugs at the checkpoint boundary).
+  - [ ] Empty fetch on a run's first iteration: skip inserting an iteration row, mark the run `SUCCESS` directly with `total_processed = 0` and no event range.
+  - [ ] Update `batch_scheduler.total_processed` and `event_to_last_modified_ts` in the same transaction as each iteration's `SUCCESS` write, not only at run end, so a crash leaves the run row accurate up to the last committed iteration.
+  - [ ] Add an index on `batch_iteration (status, iteration_id)` and on `batch_iteration (run_id)`, plus an index on `batch_scheduler` to find the latest run quickly, so the resume and start-rule queries stay fast as the tables grow.
+- [ ] Stale timeout: measure from the latest iteration's `iteration_start_ts`, not `run_start_ts`, so a long 100k catch-up run is not wrongly marked stale.
+- [ ] Starting checkpoint for the very first run (all history, or a fixed start date?).
+- [ ] Alerting when a run ends `FAILED`, or when no run has succeeded in 24 hours (scheduler itself stopped firing).
+- [ ] Retention / purge policy for `batch_scheduler` and `batch_iteration` rows.
