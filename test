@@ -1,264 +1,315 @@
-# Student Event Sync Batch — Functional Design
-
-
-## 1. Overview
-
-A scheduled batch job reads new rows from `student_event`, fetches the matching `student` record, and processes it in strict order. It resumes safely after any failure or crash without re-reading records already done.
-
-**Scope**
-
-- Runs on a scheduler (for example every 12 hours); only one instance runs at a time.
-- Reads events in batches of up to 500 (configurable) and loops until no events remain.
-- Tracks every run and every batch iteration for reporting and troubleshooting.
-
-**Key design principles**
-
-1. **Order by time.** `event_id` is a UUID and cannot be sorted, so events are ordered by `event_last_modified_ts`, with `event_id` as the tie-breaker.
-2. **Checkpoint per iteration.** Each iteration saves its checkpoint only after its work is committed. A crash loses at most one in-flight batch.
-3. **Resume from the last successful iteration.** Failed or crashed iterations are ignored when finding the resume point.
-4. **Status is the lock.** A new run starts only if the latest run is `SUCCESS` or `FAILED` (or a stuck run is stale).
-5. **Reprocessing is acceptable, skipping is not.** Redoing one batch is safe; missing an event or breaking order is not.
-
-## 2. Tables
-
-Four tables: two existing source tables and two new tracking tables. The resume point is read from `batch_iteration` only.
-
-### 2.1 student\_event (existing, source)
-
-| Column | Type | Notes |
-| --- | --- | --- |
-| event\_id | UUID | Unique, not sortable; used only as tie-breaker |
-| student\_id | VARCHAR / BIGINT | Student that changed |
-| event\_last\_modified\_ts | TIMESTAMP | Ordering column; should be DB-generated |
-
-Recommended index: `(event_last_modified_ts, event_id)`.
-
-### 2.2 student (existing, target)
-
-| Column | Type | Notes |
-| --- | --- | --- |
-| student\_id | PK | Looked up per event |
-| ...student fields... |  | Fetched and processed |
-| active | BOOLEAN | Set to `false` when the student is not found |
-
-Only this batch writes to `student`.
-
-### 2.3 batch\_scheduler (new, one row per run)
-
-| Column | Type | Notes | Example |
-| --- | --- | --- | --- |
-| run\_id | BIGINT, PK, auto-increment | Latest run = `MAX(run_id)` | 1024 |
-| status | VARCHAR | `INITIATED`, `PROCESSING`, `SUCCESS`, `FAILED` | SUCCESS |
-| run\_start\_ts | TIMESTAMP | When the scheduler fired | 2026-10-01 08:00:00 |
-| run\_end\_ts | TIMESTAMP | When the run finished (null while running or after a hard crash) | 2026-10-01 08:04:12 |
-| total\_processed | INT | Records processed in this run | 1500 |
-| event\_from\_last\_modified\_ts | TIMESTAMP | Earliest event last-modified time this run started from | 2026-09-30 14:22:10 |
-| event\_to\_last\_modified\_ts | TIMESTAMP | Latest event last-modified time this run reached | 2026-10-01 07:59:58 |
-| failed\_ts | TIMESTAMP | Set when status = `FAILED` | null (set only on failure) |
-| failed\_reason | VARCHAR | Error message or code | null |
-
-### 2.4 batch\_iteration (new, one row per batch of up to 500)
-
-| Column | Type | Notes | Example |
-| --- | --- | --- | --- |
-| iteration\_id | BIGINT, PK, auto-increment |  | 50213 |
-| run\_id | FK to batch\_scheduler | Groups iterations by run | 1024 |
-| iteration\_no | INT | 1, 2, 3 ... within the run | 2 |
-| status | VARCHAR | `PROCESSING`, `SUCCESS`, `FAILED` | SUCCESS |
-| iteration\_start\_ts / iteration\_end\_ts | TIMESTAMP | Whole iteration (fetch + process) | 2026-10-01 08:01:30 / 2026-10-01 08:02:45 |
-| fetched\_count | INT | Rows fetched (max 500) | 500 |
-| processed\_count | INT | Distinct students processed after dedup | 462 (38 duplicate student\_ids collapsed) |
-| event\_from\_last\_modified\_ts / event\_from\_id | TIMESTAMP / UUID | Checkpoint this iteration started from | 2026-09-30 18:40:05 / 7c9e6679-7425-40de-944b-e07fc1f90ae7 |
-| event\_to\_last\_modified\_ts / event\_to\_id | TIMESTAMP / UUID | Last event processed = new checkpoint | 2026-10-01 03:12:47 / 3f2504e0-4f89-11d3-9a0c-0305e82c3301 |
-| failed\_reason | VARCHAR | Set when status = `FAILED` | null (e.g. "SQLException: connection reset" when FAILED) |
-
-The `from_*` and `to_*` columns give the event last-modified time range each iteration covered. The `to_*` of the latest `SUCCESS` iteration is the resume point, and rolls up to the run's `from_event_last_modified_ts` / `to_event_last_modified_ts` so you can see the full window a whole run covered.
-
-## 3. End-to-end flow
-
-&#91;embedded content: batch run flow · init, iteration loop, success and fail exits\]
-
-A run loops over iterations until a fetch returns fewer than 500 events; any error ends the run as `FAILED`, and the next run resumes from the last saved checkpoint.
-
-## 4. Use case 1 — Init (scheduler starts)
-
-The scheduler fires and decides whether a new run may start.
-
-**Steps**
-
-1. Read the latest row: `SELECT * FROM batch_scheduler ORDER BY run_id DESC LIMIT 1`.
-2. Apply the start rule:
-
-| Latest run status | Action |
-| --- | --- |
-| No row (first ever run) | Start; checkpoint = beginning (or a configured start time) |
-| `SUCCESS` | Start a new run |
-| `FAILED` | Start a new run (resumes from last successful iteration) |
-| `INITIATED` / `PROCESSING`, not stale | Exit; another run is active |
-| `INITIATED` / `PROCESSING`, older than stale timeout | Mark it `FAILED`, reason `STALE_RUN_TIMEOUT`, then start |
-
-3. Insert a new `batch_scheduler` row: status `INITIATED`, `run_start_ts = now`.
-4. Read the resume checkpoint from the latest `SUCCESS` iteration (section 8, query B).
-5. Count pending events after the checkpoint.
-6. If the count is 0: set status `SUCCESS`, `run_end_ts = now`, `total_processed = 0`, and exit.
-7. Otherwise set status `PROCESSING` and start the iteration loop (use case 2).
-
-**What the statuses tell you when stuck**
-
-- Stuck on `INITIATED`: died before any batch started (for example DB connection failed).
-- Stuck on `PROCESSING`: died in the middle of a batch.
-
-## 5. Use case 2 — Success (iteration loop)
-
-Each iteration processes up to 500 events and saves its checkpoint before the next one starts.
-
-**Steps per iteration**
-
-1. Insert a `batch_iteration` row: status `PROCESSING`, `iteration_start_ts`, `from_*` = current checkpoint.
-2. Count pending events after the checkpoint → `total_pending`.
-3. Record `fetch_start_ts`, fetch up to 500 events ordered by `event_last_modified_ts, event_id` (section 8, query C), record `fetch_end_ts`.
-4. If 0 rows fetched: delete or close this iteration row and end the loop (go to step 9).
-5. Dedup by `student_id`, keeping the latest event per student.
-6. For each student, in order of `event_last_modified_ts`:
-   - Found → fetch the record and process / print it.
-   - Not found → set `active = false` and log it.
-7. Commit the student changes.
-8. In ONE transaction, update the iteration row: status `SUCCESS`, `iteration_end_ts`, counts, `remaining`, `to_*` = last event fetched. Then update `batch_scheduler.total_iterations` and `total_processed`.
-9. If fewer than 500 rows were fetched, the backlog is drained: set run status `SUCCESS`, `run_end_ts = now`, exit. Otherwise loop to step 1.
-
-**Example: 1,000 pending, batch size 500**
-
-| Iteration | total\_pending | fetched | cumulative\_processed | remaining | status |
-| --- | --- | --- | --- | --- | --- |
-| 1 | 1,000 | 500 | 500 | 500 | SUCCESS |
-| 2 | 500 | 500 | 1,000 | 0 | SUCCESS |
-| 3 | 0 | 0 | 1,000 | 0 | loop ends |
-
-Events that arrive during the run are picked up naturally because `total_pending` is recounted each iteration.
-
-## 6. Use case 3 — Fail
-
-A failure costs at most the one in-flight batch; completed iterations keep their checkpoints.
-
-### 6.1 Handled failure (error is caught)
-
-Examples: network error after JDBC retries are exhausted, SQL error, bad data.
-
-1. Catch the error and stop processing the batch.
-2. Roll back uncommitted student changes for this batch.
-3. Update the iteration row: status `FAILED`, `iteration_end_ts`, `failed_reason`. Do NOT write `to_*`.
-4. Update the run row: status `FAILED`, `failed_ts`, `failed_reason`, `run_end_ts`.
-5. Exit. No immediate retry; the next scheduled run resumes.
-
-### 6.2 Hard crash (no chance to update)
-
-Examples: out of memory, process killed, server restart.
-
-- Nothing is written. The iteration row stays `PROCESSING`; the run row stays `PROCESSING` with no `run_end_ts`.
-- The next scheduler sees a stuck run. Once it is older than the stale timeout, it marks the run `FAILED` (`STALE_RUN_TIMEOUT`) and starts a new run.
-
-### 6.3 How the next run resumes
-
-The resume point is the `to_*` checkpoint of the latest `SUCCESS` iteration across all runs. `FAILED` and stuck `PROCESSING` iterations are ignored.
-
-**Example: 900k pending, crash after 500k**
-
-- Iterations 1–1,000 succeeded; each saved its checkpoint. Iteration 1,001 crashed.
-- Next run reads the checkpoint of iteration 1,000 (the 500,000th event).
-- Query C returns only events after that point, so the next run processes the remaining 400k. The 500k done are never read again.
-- The 500 events of iteration 1,001 are redone, which is acceptable.
-
-### 6.4 Failure cases covered
-
-| When it fails | Result | Next run |
-| --- | --- | --- |
-| Before any fetch (startup, DB down) | Run stuck in `INITIATED` or marked `FAILED` | Starts from last checkpoint |
-| During event fetch | Iteration `FAILED`, nothing processed | Redoes the same batch |
-| During processing (event 300 of 500) | Partial batch rolled back | Redoes the full batch |
-| During the success write | Transaction rolls back; iteration not `SUCCESS` | Redoes the batch |
-| Hard crash anywhere | Rows left `PROCESSING` | After stale timeout, resumes from last `SUCCESS` iteration |
-
-## 7. Business rules and edge cases
-
-| # | Case | Rule |
-| --- | --- | --- |
-| 1 | No events pending | Run ends `SUCCESS` with 0 processed |
-| 2 | Fewer than 500 events | Process what is there; batch size is a ceiling |
-| 3 | Large backlog (e.g. 100k) | Loop batch after batch in the same run until drained |
-| 4 | Same student twice in a batch | Dedup; process the latest event only |
-| 5 | Student not found | Set `active = false`, log, continue |
-| 6 | Same event\_`last_modified_ts` on many events | Tie-break on `event_id`; checkpoint stores both |
-| 7 | Events arrive during a run | Picked up in later iterations via recount |
-| 8 | Overlapping scheduler trigger | Blocked by status check on latest run |
-| 9 | Network blip | JDBC retry layer handles it; if exhausted → handled failure |
-| 10 | Reprocessing a batch | Allowed; processing must be idempotent |
-| 11 | Order of updates | Always ascending event\_`last_modified_ts, event_id`; never skip ahead |
-
-**Configuration**
-
-- `batch.size` = 500
-- `stale.timeout` = e.g. 60 minutes (must exceed the longest normal run)
-- `scheduler.cron` = e.g. every 12 hours
-
-## 8. Key SQL queries
-
-**A. Latest run (start check)**
-
-```sql
-SELECT run_id, status, run_start_ts
-FROM batch_scheduler
-ORDER BY run_id DESC
-LIMIT 1;
-```
-
-**B. Resume checkpoint (latest successful iteration)**
-
-```sql
-SELECT to_event_last_modified_ts, to_event_id
-FROM batch_iteration
-WHERE status = 'SUCCESS'
-ORDER BY iteration_id DESC
-LIMIT 1;
-```
-
-**C. Fetch next batch**
-
-```sql
-SELECT event_id, student_id, event_last_modified_ts
-FROM student_event
-WHERE event_last_modified_ts > :lastTs
-   OR (event_last_modified_ts = :lastTs AND event_id > :lastEventId)
-ORDER BY event_last_modified_ts, event_id
-LIMIT 500;
-```
-
-**D. Pending count**
-
-```sql
-SELECT COUNT(*)
-FROM student_event
-WHERE event_last_modified_ts > :lastTs
-   OR (event_last_modified_ts = :lastTs AND event_id > :lastEventId);
-```
-
-**E. Mark iteration success (same transaction)**
-
-```sql
-UPDATE batch_iteration
-SET status = 'SUCCESS', iteration_end_ts = CURRENT_TIMESTAMP,
-    fetched_count = :fetched, processed_count = :processed,
-    cumulative_processed = :cumulative, remaining = :remaining,
-    to_event_last_modified_ts = :toTs, to_event_id = :toEventId
-WHERE iteration_id = :iterationId;
-```
-
-## 9. Open items
-
-- [ ] Confirm `event_last_modified_ts` is stored as UTC and that the JDBC driver and Java code read/bind it as `Instant`/`Timestamp` without converting through local time or a formatted string (avoids clock-skew and time-zone bugs at the checkpoint boundary).
-  - [ ] Empty fetch on a run's first iteration: skip inserting an iteration row, mark the run `SUCCESS` directly with `total_processed = 0` and no event range.
-  - [ ] Update `batch_scheduler.total_processed` and `event_to_last_modified_ts` in the same transaction as each iteration's `SUCCESS` write, not only at run end, so a crash leaves the run row accurate up to the last committed iteration.
-  - [ ] Add an index on `batch_iteration (status, iteration_id)` and on `batch_iteration (run_id)`, plus an index on `batch_scheduler` to find the latest run quickly, so the resume and start-rule queries stay fast as the tables grow.
-- [ ] Stale timeout: measure from the latest iteration's `iteration_start_ts`, not `run_start_ts`, so a long 100k catch-up run is not wrongly marked stale.
-- [ ] Starting checkpoint for the very first run (all history, or a fixed start date?).
-- [ ] Alerting when a run ends `FAILED`, or when no run has succeeded in 24 hours (scheduler itself stopped firing).
-- [ ] Retention / purge policy for `batch_scheduler` and `batch_iteration` rows.
+Tutrotial of Student 
+Student COMPLETE TECHNICAL PLAN — SQL SERVER BACKFILL AND KAFKA-TO-BDI MIGRATION
+Version: 1.0 (discussion-based working specification)
+Date: October 10, 2026
+Status: DRAFT — implementation details, owners, cutover date, and source precedence require confirmation.
+
+Student DOCUMENT ORGANIZATION
+Task 1 — SQL Server Data Backfill
+Task 2 — Kafka-to-BDI Migration
+  2A. Next Run Start Time Calculation Algorithm
+  2B. Kafka-to-BDI Switching Algorithm
+  2C. Kafka-to-BDI Data Reconciliation and Discrepancy Analysis
+  2D. Desk to BDI Mapping (Event / Java / Database Field Mapping)
+Cross-Task Controls and Open Decisions
+
+======================================================================
+TASK 1 — Student SQL SERVER DATA BACKFILL
+======================================================================
+
+1. PURPOSE AND SCOPE
+Populate approximately four or five production target tables from CSV-sourced data using SQL Server staging tables. Compare staging rows with target rows using primary keys, then insert missing rows and update changed rows. Analyze impact before modification, preserve recoverability, and validate results first in non-production and then in production.
+
+2. PHASE I — DATA PREPARATION AND STAGING (PRE-EXECUTION)
+  2.1 Import full CSV input into the designated dump/raw-load area.
+  2.2 Derive and populate normalized staging tables, e.g., staging_X for target X.
+  2.3 Validate file completeness, schema, field types, key presence, and row counts.
+  2.4 Deduplicate staging data based on the target primary key, using an explicit conflict rule.
+  2.5 Ensure useful indexes on the staging join keys and target primary keys.
+  2.6 Run a pre-execution comparison for each table:
+      - Total staging and target rows
+      - Rows requiring INSERT (key absent in target)
+      - Rows requiring UPDATE (key present; tracked values differ)
+      - Rows UNCHANGED (key present; compared values identical)
+      - Rows requiring review (invalid or duplicate keys, source conflicts)
+      - Percentage impact and sampled anomalies
+  2.7 Review report and approve the action plan; agree on manual-edit precedence.
+
+3. PHASE II — CONTROLLED BACKFILL EXECUTION (MAIN EXECUTION)
+  3.1 Schedule the execution window, agree on owners, and prevent competing writes as appropriate.
+  3.2 Back up all affected tables, with a documented restoration method.
+  3.3 Verify that backups contain the expected rows and columns; test restoration in non-production.
+  3.4 Ask the DBA to arrange and verify a database-level backup where feasible. A database backup is a complementary Plan B, not a substitute for a tested restore plan.
+  3.5 Materialize the planned INSERT/UPDATE keys (e.g., a temp/work table) if useful to avoid repeated comparisons.
+  3.6 Execute set-based SQL Server stored procedures for each table:
+      - Match staging_X to X on the full primary key.
+      - INSERT rows absent from X.
+      - UPDATE only rows with actual value differences and permitted by source-precedence rules.
+      - Preserve unchanged rows.
+      - Record inserted, updated, unchanged, skipped, rejected, and failed counts.
+  3.7 Use appropriately sized batches (if needed) for ~4 million-row workloads, control lock and transaction-log pressure, and make batches restartable/idempotent.
+  3.8 Roll back failed transactions or invoke the documented restore plan when safe rollback is not possible.
+  3.9 Reconcile actual changes with pre-execution estimates, accounting for any intervening updates.
+
+4. PHASE III — POST-BACKFILL VERIFICATION (POST-EXECUTION)
+  4.1 Verify row counts, key uniqueness, referential integrity, and sampled field values.
+  4.2 Run application regression/integration tests and business checks.
+  4.3 Review errors, skipped rows, and source conflicts and document resolutions.
+  4.4 Obtain technical and business sign-off. Keep execution logs and backup references.
+
+5. DEPLOYMENT ORDER
+Non-production rehearsal -> count reconciliation -> restore/rollback test -> regression testing -> approval -> production staging and backup verification -> production backfill -> production reconciliation/testing -> sign-off.
+Do not promote automatically merely because SQL completed successfully.
+
+6. SOURCE COLUMN MANAGEMENT (SHARED WITH MIGRATION)
+Proposed values: 'Kafka', 'BDI', 'Manual', 'Backfill'.
+  - Existing Kafka-originated rows: initialize source to 'Kafka' only if provenance is established; otherwise document the assumption.
+  - Rows actually inserted/changed by Kafka: source = 'Kafka'.
+  - Rows actually inserted/changed by BDI: source = 'BDI'.
+  - Rows manually changed by a user: source = 'Manual'.
+  - Rows actually inserted/changed by CSV backfill: source = 'Backfill'.
+  - Unchanged rows: preserve existing source.
+Open policy decision: should Backfill/BDI/Kafka overwrite a row marked 'Manual'? Decide before coding; maintain an audit trail if field-level provenance matters. A single source column tracks the last modifying source, not a full change history.
+
+7. BACKFILL FLOW (TEXT)
+CSV -> Raw/Dump Load -> Staging Tables -> Validate/Deduplicate
+    -> Compare Staging vs Targets -> Pre-Action Insert/Update/Conflict Report
+    -> Approve -> Verify Table Backups (+ DBA Database Backup if available)
+    -> Stored Procedures (INSERT / UPDATE only changed rows)
+    -> Reconcile Counts -> Regression & Business Tests
+    -> Pass? YES: Sign off | NO: Investigate / Roll back / Restore.
+
+8. SQL SERVER IMPLEMENTATION NOTES
+Prefer indexed, set-based UPDATE ... FROM and INSERT ... SELECT ... WHERE NOT EXISTS with concurrency-safe transaction design. Avoid row-by-row cursor processing for millions of rows. Consider NULL-safe comparisons, composite keys, consistent snapshots for the preview report, deadlock handling, and retry-safe batch markers. Test the query plans, duration, and transaction log capacity in non-production before choosing batch sizes. Actual run time cannot be predicted from row count alone.
+
+======================================================================
+TASK 2 — Student KAFKA-TO- Student BDI MIGRATION
+======================================================================
+
+2A. NEXT RUN START TIME CALCULATION ALGORITHM
+
+Purpose: determine the event-fetch starting timestamp for the next processing run.
+
+RULES
+  1. Check whether any run is IN_PROGRESS. If yes, do not start a concurrent run.
+  2. Otherwise find the MAX(run_id) (the latest run as defined in this design).
+  3. Within that run, find MAX(iteration_id) WHERE iteration_status = 'SUCCESS'.
+     IMPORTANT: select the latest SUCCESSFUL iteration, not merely the latest iteration regardless of status.
+  4. If a successful iteration exists, next_run_start_time = its successful iteration_end_time.
+  5. If no successful iteration exists in the latest run, next_run_start_time = latest_run.run_start_time.
+  6. If no run exists yet, next_run_start_time = configured initial start time.
+  7. Use this boundary for the next event fetch.
+
+PSEUDOCODE
+  if exists_run_with_status('IN_PROGRESS'):
+      STOP
+  latest_run = get_run_with_max_run_id()
+  if latest_run is None:
+      next_run_start_time = configured_initial_start_time
+  else:
+      success_iteration = get_iteration_with_max_id(
+          run_id=latest_run.run_id, status='SUCCESS')
+      if success_iteration is not None:
+          next_run_start_time = success_iteration.iteration_end_time
+      else:
+          next_run_start_time = latest_run.run_start_time
+
+FLOW
+Start -> Any run IN_PROGRESS? -> YES: Stop
+                            -> NO: MAX run_id found?
+                                   -> NO: Initial configured time
+                                   -> YES: MAX successful iteration_id found?
+                                          -> YES: Its success end time
+                                          -> NO: Latest run start time
+                          -> Start next run from selected time.
+
+SAFETY NOTE
+The selected timestamp must be a safe replay boundary. Verify event timestamp semantics, inclusivity (> or >=), pagination, deduplication/idempotency, and late-arriving events so that failures do not cause dropped events. MAX(run_id) assumes IDs correctly represent run order.
+
+---------------------------------------------------------------------
+2B. Student KAFKA-TO- Student BDI SWITCHING ALGORITHM
+---------------------------------------------------------------------
+
+PURPOSE
+Move event/data updates from the current Kafka-based path to BDI with a controlled cutoff, verification, and recovery plan.
+
+STEP 1 — PLAN THE CUTOFF
+  - Ask the BDI team for constraints, cutoff timing, dependencies, and preferred window.
+  - If flexible and no blocking dependencies exist, tentatively target a date in November 2026, before the relevant deadline, leaving time for remediation.
+  - Confirm stakeholders, change approvals, communication plan, monitoring owner, and freeze/cutover window.
+  - The final date/time is NOT yet agreed.
+
+STEP 2 — PRE-SWITCH READINESS
+  - Confirm Task 1 backfill has been rehearsed and executed as required, and Task 2C reconciliation meets agreed gates.
+  - Back up impacted SQL Server tables and verify recoverability.
+  - Coordinate an additional database-level backup with the DBA where feasible.
+  - Record Kafka offsets/checkpoints, BDI starting boundary, and exact cutover timestamp.
+  - Define whether Kafka writes are paused, drained, or disabled before enabling BDI to avoid dual writes.
+  - Verify BDI connector, credentials, scheduler, monitoring, schema and mapping readiness.
+  - Establish a tested rollback procedure and an explicit rollback decision owner.
+
+STEP 3 — CONTROLLED HANDOFF
+  - Record the final Kafka processed boundary and verify outstanding Kafka events are drained or replayable.
+  - Stop or disable Kafka updates according to the approved plan.
+  - Enable BDI processing from the agreed boundary using the next-run start-time rule where applicable.
+  - Prevent gaps and duplicate updates through checkpointing and idempotent processing.
+  - For BDI-created or truly changed rows, set source = 'BDI'. Do not mass-update all source values merely because the source system changed.
+
+STEP 4 — POST-SWITCH VALIDATION
+  - Compare BDI event ingestion, database row counts, spot checks, source flags, and latency against expected behavior.
+  - Run application smoke/regression tests and inspect errors, delayed events, and data anomalies.
+  - Document outcome and obtain sign-off.
+
+STEP 5 — FAILURE / ROLLBACK
+  - If critical validation fails, stop new BDI processing safely; identify its last committed checkpoint.
+  - Follow the approved restart/rollback plan to avoid data loss or double application.
+  - Restore tables/database only after assessing any valid post-cutover writes that would otherwise be lost.
+  - Escalate to BDI, DBA, application, and business owners; record incident and replan.
+
+SWITCH FLOW
+BDI Cutoff Discussion -> Agree Window -> Readiness & Mapping/Reconciliation Gates
+ -> Verify Backups + Checkpoints + Rollback
+ -> Disable/Drain Kafka -> Activate BDI -> Monitor & Reconcile
+ -> PASS: Sign-off | FAIL: Contain, Recover, and Replan.
+
+CUTOVER CHECKLIST
+[ ] BDI team confirms permissible cutoff window
+[ ] November target date/time agreed and communicated
+[ ] Non-production rehearsal passed
+[ ] Mapping specification reviewed
+[ ] Reconciliation issues accepted/resolved
+[ ] Table backups verified; DBA backup decision recorded
+[ ] Kafka and BDI replay boundaries captured
+[ ] Source-column behavior verified
+[ ] Rollback steps tested; owners and contacts assigned
+[ ] Kafka disabled/drained and BDI enabled without overlap/gap
+[ ] Smoke test, regression test, and reconciliation passed
+[ ] Formal sign-off and monitoring handover completed
+
+---------------------------------------------------------------------
+2C. KAFKA-TO-BDI DATA RECONCILIATION AND DISCREPANCY ANALYSIS
+---------------------------------------------------------------------
+
+PURPOSE
+Compare staging/BDI-sourced values against the original SQL Server tables, quantify differences, detect material anomalies, and produce evidence and questions for the BDI team. Scope: five tables initially; actual table names to be populated.
+
+FOR EACH TABLE
+  1. Define the joining key, compared fields, normalization rules, and eligible population.
+  2. Compare key fields including student ID, student name, related identifiers, and important business attributes.
+  3. Flag missing student ID as UNVERIFIED rather than silently counting it as a match.
+  4. Classify comparisons: MATCH, FIELD_MISMATCH, MISSING_IN_STAGING,
+     MISSING_IN_TARGET, UNVERIFIED, and OTHER_EXCEPTION.
+  5. Report per-field and per-table counts and percentages.
+  6. Select up to 50 discrepant records per table, prioritizing the most recently updated; state date range, sort order, and relevant source timestamps.
+  7. Record examples of each mismatch, possible cause, question to the BDI team, response, owner, disposition, and follow-up date.
+  8. Escalate critical discrepancies regardless of overall percentage.
+
+QUALITY THRESHOLDS DISCUSSED
+  - 90% or above was mentioned as broadly acceptable for an initial comparison.
+  - The more stringent desired target is 95% or above across important fields.
+  - Proposed reporting: >=95% TARGET MET; 90%-<95% REVIEW; <90% ESCALATE.
+  - Thresholds, denominators, and whether unverified rows count as failures require team approval. Never treat 95% as permission to ignore critical identifier mismatches.
+
+METRIC DEFINITIONS (PROPOSED)
+  Eligible paired records = rows matched on valid comparison keys.
+  Field match % = 100 * matching, non-null-equivalent paired values /
+                       eligible paired records.
+  Coverage % = 100 * paired valid-key records / total expected source records.
+  Unverified % = 100 * rows missing a required identifier / total assessed rows.
+  Report missing-key and missing-row rates separately; do not hide them in the field-match denominator.
+
+FIVE-TABLE SUMMARY TEMPLATE
+Table | Compared | Matched | Mismatched | Unverified | Coverage% | Match% | Status
+T1    | TBD      | TBD     | TBD        | TBD        | TBD       | TBD    | TBD
+T2    | TBD      | TBD     | TBD        | TBD        | TBD       | TBD    | TBD
+T3    | TBD      | TBD     | TBD        | TBD        | TBD       | TBD    | TBD
+T4    | TBD      | TBD     | TBD        | TBD        | TBD       | TBD    | TBD
+T5    | TBD      | TBD     | TBD        | TBD        | TBD       | TBD    | TBD
+
+RECENT DISCREPANCY SAMPLE TEMPLATE (UP TO 50 PER TABLE)
+Table | Key | Field | Staging/BDI Value | Original Value | Latest Update Time | Classification | Question/Owner | Resolution
+TBD   | TBD | TBD   | TBD               | TBD            | TBD                | TBD            | TBD            | TBD
+
+BDI CLARIFICATION EXAMPLES
+  - For student [key], the student name differs between sources. Which system is authoritative?
+  - Is a missing main student ID expected for this record, or does it indicate incomplete data?
+  - When values differ, does the more recent update timestamp indicate the correct value?
+  - Are there expected formatting, case, whitespace, identifier, or transformation differences?
+  - Which discrepancies block cutover, and which are documented acceptable exceptions?
+
+REPORT RULE
+Maintain a discrepancy/exception log with SQL script version, execution time, dataset window, counts, sample evidence, business impact, owner, BDI answer, and final resolution. Actual percentages cannot be filled until scripts execute.
+
+---------------------------------------------------------------------
+2D. DESK TO BDI MAPPING
+    (EVENT / JAVA / DATABASE FIELD MAPPING SPECIFICATION)
+---------------------------------------------------------------------
+
+DOCUMENT NAME AGREED IN CONVERSATION
+'Desk to BDI Mapping' (retain this agreed short title). Kafka and BDI are separate mapping sections plus a consolidated field-level matrix.
+
+PURPOSE
+Record every relevant field and its lineage, including Kafka event name, Kafka event property, Java property, SQL Server target table.column, BDI source table.column, types, sizes, nullability, defaults, transformation logic, and notes.
+
+SECTION A — KAFKA MAPPING TABLE (REPEAT FOR EVERY KAFKA EVENT/FIELD)
+Kafka Event | Kafka Property | Kafka Type | Java Class/Property | Java Type | Target Table.Column | SQL Type | SQL Size/Precision/Scale | Nullable? | PK? | Default | Transformation | Kafka Notes
+TBD         | TBD            | TBD        | TBD                 | TBD       | TBD                 | TBD      | TBD                      | TBD       | TBD | TBD     | TBD            | TBD
+
+SECTION B — BDI MAPPING TABLE (REPEAT FOR EVERY BDI FIELD)
+BDI Table.Column | BDI Type | BDI Size/Precision/Scale | Java Class/Property (if applicable) | Java Type | Target Table.Column | SQL Type | SQL Size/Precision/Scale | Nullable? | PK? | Default | Transformation | BDI Notes
+TBD              | TBD      | TBD                      | TBD                                 | TBD       | TBD                 | TBD      | TBD                      | TBD       | TBD | TBD     | TBD            | TBD
+
+SECTION C — CONSOLIDATED FIELD-LEVEL MATRIX
+Logical Field | Kafka Event.Property | Kafka Java Property | BDI Table.Column | BDI Java Property (if used) | Target Table.Column | Source/Target Types | Size | Kafka vs BDI Difference | Mapping Status
+TBD           | TBD                  | TBD                 | TBD              | TBD                         | TBD                 | TBD                 | TBD  | TBD                     | TBD
+
+SECTION D — NOTES, VALIDATIONS, AND CHECKS
+  D1. Kafka-specific notes:
+      - Event/version consumed, missing/optional properties, Kafka-side conversions,
+        date/time representation, uniqueness, and event ordering.
+  D2. BDI-specific notes:
+      - Source schema, extraction/refresh semantics, missing fields, data transforms,
+        CDC/checkpoint behavior, and null handling.
+  D3. Common notes:
+      - Required fields, key constraints, target length/precision, normalization,
+        enum mappings, timezone conventions, default and null rules, source precedence,
+        validation ownership and resolution decisions.
+
+MAPPING COMPLETENESS CHECKS
+[ ] Every consumed Kafka event is listed
+[ ] Every relevant Kafka property is mapped to Java and target SQL column
+[ ] Every relevant BDI column is mapped to its target column
+[ ] Data type, size/precision/scale and nullability are recorded
+[ ] Primary/composite keys and defaults are recorded
+[ ] Transformations and unmapped fields are explained
+[ ] Kafka / BDI / common validation notes are recorded
+[ ] Mapping mismatches have decisions/owners and sign-off
+
+======================================================================
+CROSS-TASK CONTROLS AND OPEN DECISIONS
+======================================================================
+
+A. Proposed dependency order:
+  1. Finalize field mapping and source precedence decisions.
+  2. Perform staging/backfill rehearsal and reconciliation in non-production.
+  3. Test next-run checkpoint boundaries and Kafka-to-BDI switch in non-production.
+  4. Resolve critical data anomalies; obtain BDI and business sign-offs.
+  5. Back up and execute approved production work, with monitoring and recovery controls.
+
+B. Decisions still required:
+  - Exact four/five backfill target table names and five reconciliation tables.
+  - Exact Kafka event names, Java field names, BDI table names, and SQL schemas.
+  - Correct field mappings, data types, sizes, comparison normalization.
+  - Whether 'Desk' is the intended permanent naming convention.
+  - Source precedence for Manual versus Kafka/BDI/Backfill writes.
+  - Authoritative system for disputed student details and required-ID policy.
+  - Approved 90%/95% thresholds and critical-field cutover gates.
+  - Final November 2026 cutover window, stakeholders, DBA backup/restore SLA.
+  - DB-specific procedure implementations, transaction isolation, and batching.
+
+C. Important boundaries:
+  - These are algorithms, runbook steps, and report templates, not evidence that scripts have executed.
+  - No production data, discrepancy samples, real metrics, backup confirmations, or approvals have been supplied.
+  - Confirm the agreed requirements and test in a non-production environment before production use.
+
+END OF DOCUMENT
